@@ -1,0 +1,26 @@
+{
+  "canisters": {
+    "doxa_backend": {
+      "main": "src/doxa_backend/main.mo",
+      "type": "motoko"
+    },
+    "doxa_frontend": {
+      "dependencies": [
+        "doxa_backend"
+      ],
+      "source": [
+        "src/doxa_frontend/dist"
+      ],
+      "type": "assets",
+      "workspace": "doxa_frontend"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}
