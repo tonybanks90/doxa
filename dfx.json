@@ -4,6 +4,10 @@
       "main": "src/doxa_backend/main.mo",
       "type": "motoko"
     },
+    "marketfactory": {
+      "main": "src/doxa_backend/MarketFactory/factory.mo",
+      "type": "motoko"
+    },
     "doxa_frontend": {
       "dependencies": [
         "doxa_backend"
