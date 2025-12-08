@@ -1,17 +1,23 @@
 {
   "canisters": {
-    "doxa_backend": {
-      "main": "src/doxa_backend/main.mo",
-      "type": "motoko"
-    },
     "marketfactory": {
       "main": "src/doxa_backend/MarketFactory/factory.mo",
       "type": "motoko"
     },
+    "vault": {
+      "main": "src/doxa_backend/Vault/vault.mo",
+      "type": "motoko"
+    },
+    "markettrade": {
+      "main": "src/doxa_backend/MarketTrade/markets.mo",
+      "type": "motoko"
+    },
+    "markets": {
+      "main": "src/doxa_backend/Market/market.mo",
+      "type": "motoko"
+    },
     "doxa_frontend": {
-      "dependencies": [
-        "doxa_backend"
-      ],
+      "dependencies": [],
       "source": [
         "src/doxa_frontend/dist"
       ],
