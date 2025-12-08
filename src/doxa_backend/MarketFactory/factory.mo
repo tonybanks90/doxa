@@ -16,6 +16,7 @@ import Char "mo:base/Char";
 import TrieMap "mo:base/TrieMap";
 import Cycles "mo:base/ExperimentalCycles";
 import Float "mo:base/Float";
+import Int "mo:base/Int";
 
 persistent actor TokenFactory {
   // ===== ICRC-151 TYPES =====
@@ -42,32 +43,24 @@ persistent actor TokenFactory {
       max_supply : ?Nat,
       fee : ?Nat,
       logo : ?Text,
-      description : ?Text
+      description : ?Text,
     ) -> async CandidResult<TokenId, Text>;
 
     mint_tokens : (
       token_id : TokenId,
       to : Account,
       amount : Nat,
-      memo : ?Blob
+      memo : ?Blob,
     ) -> async CandidResult<Nat64, Text>;
 
     get_balance : (
       token_id : TokenId,
-      account : Account
+      account : Account,
     ) -> async CandidResult<Nat, Text>; // Note: Error type is actually QueryError in candid, but we'll treat as Text for now or need to define QueryError
 
     get_token_metadata : (
       token_id : TokenId
-    ) -> async CandidResult<{
-      name : Text;
-      symbol : Text;
-      decimals : Nat8;
-      fee : Nat;
-      total_supply : Nat;
-      logo : ?Text;
-      description : ?Text;
-    }, Text>; // Error is QueryError
+    ) -> async CandidResult<{ name : Text; symbol : Text; decimals : Nat8; fee : Nat; total_supply : Nat; logo : ?Text; description : ?Text }, Text>; // Error is QueryError
 
     list_tokens : () -> async [TokenId];
   };
@@ -214,6 +207,7 @@ persistent actor TokenFactory {
   private stable var icrc151_wasm : ?Blob = null;
   private stable var marketInfoEntries : [(MarketId, MarketInfo)] = [];
   private stable var createdLedgers : [Principal] = [];
+  private stable var marketsCanister : ?Principal = null;
 
   private transient var marketInfo = TrieMap.TrieMap<MarketId, MarketInfo>(
     Nat.equal,
@@ -255,7 +249,7 @@ persistent actor TokenFactory {
     switch (res) {
       case (#Ok(ok)) #ok(ok);
       case (#Err(err)) #err(err);
-    }
+    };
   };
 
   private func validateTitle(title : Text) : Bool {
@@ -411,6 +405,44 @@ persistent actor TokenFactory {
     };
   };
 
+  // ===== MARKETS CANISTER INTEGRATION =====
+
+  // VaultAddressConfig type to match markettrade canister
+  type VaultAddressConfig = {
+    #Binary : { marketVault : Principal };
+    #MultipleChoice : { marketVault : Principal };
+    #Compound : { subjectVaults : [(Text, Principal)] };
+  };
+
+  // Interface for the MarkeTrade canister
+  type MarketsInterface = actor {
+    registerBinaryMarketWithVault : shared ({
+      base : {
+        question : Text;
+        resolver : Principal;
+        expiry : Nat64;
+        totalSupply : Nat64;
+        b : Float;
+      };
+      ledger : Principal;
+      yesTokenId : TokenId;
+      noTokenId : TokenId;
+    }) -> async Result.Result<{ marketId : Nat; vaultConfig : VaultAddressConfig; setupComplete : Bool }, Text>;
+  };
+
+  public shared ({ caller }) func setMarketsCanister(canister : Principal) : async Result.Result<(), Text> {
+    if (not Principal.isController(caller)) {
+      return #err("Only controller can set Markets canister");
+    };
+    marketsCanister := ?canister;
+    Debug.print("Markets canister set to: " # Principal.toText(canister));
+    #ok();
+  };
+
+  public query func getMarketsCanister() : async ?Principal {
+    marketsCanister;
+  };
+
   // ===== HELPER FUNCTIONS =====
 
   // Deploy a new ICRC-151 ledger canister
@@ -488,12 +520,12 @@ persistent actor TokenFactory {
       switch (result) {
         case (#Ok(tokenId)) {
           Debug.print("✓ Token created successfully: " # name);
-          #ok(tokenId)
+          #ok(tokenId);
         };
         case (#Err(e)) {
           let errorMsg = "Failed to create token " # name # ": " # e;
           Debug.print(errorMsg);
-          #err(errorMsg)
+          #err(errorMsg);
         };
       };
     } catch (e) {
@@ -597,6 +629,41 @@ persistent actor TokenFactory {
     Debug.print("Cycle cost: ~0.85T (saved 0.85T vs ICRC-2)");
     Debug.print("Remaining cycles: " # Nat.toText(Cycles.balance()));
     Debug.print("========================================");
+
+    // Register the market with the MarkeTrade canister if configured
+    switch (marketsCanister) {
+      case (null) {
+        Debug.print("Note: Markets canister not configured, skipping registration");
+      };
+      case (?marketsId) {
+        Debug.print("Registering market with MarkeTrade canister...");
+        let marketsActor : MarketsInterface = actor (Principal.toText(marketsId));
+        try {
+          let regResult = await marketsActor.registerBinaryMarketWithVault({
+            base = {
+              question = args.title;
+              resolver = caller;
+              expiry = Nat64.fromNat(Int.abs(args.expirationTime));
+              totalSupply = 1_000_000_000_000 : Nat64; // 1 trillion satoshis
+              b = 10000.0; // AMM b parameter
+            };
+            ledger = ledger;
+            yesTokenId = yesTokenId;
+            noTokenId = noTokenId;
+          });
+          switch (regResult) {
+            case (#ok(result)) {
+              Debug.print("✓ Market registered with MarkeTrade. Internal ID: " # Nat.toText(result.marketId));
+            };
+            case (#err(e)) {
+              Debug.print("⚠ Failed to register with MarkeTrade: " # e);
+            };
+          };
+        } catch (e) {
+          Debug.print("⚠ Error calling MarkeTrade: " # Error.message(e));
+        };
+      };
+    };
 
     #ok(marketId);
   };
