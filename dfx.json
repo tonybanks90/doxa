@@ -12,10 +12,6 @@
       "main": "src/doxa_backend/MarketTrade/markets.mo",
       "type": "motoko"
     },
-    "markets": {
-      "main": "src/doxa_backend/Market/market.mo",
-      "type": "motoko"
-    },
     "doxa_frontend": {
       "dependencies": [],
       "source": [
