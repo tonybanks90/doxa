@@ -63,6 +63,9 @@ persistent actor TokenFactory {
     ) -> async CandidResult<{ name : Text; symbol : Text; decimals : Nat8; fee : Nat; total_supply : Nat; logo : ?Text; description : ?Text }, Text>; // Error is QueryError
 
     list_tokens : () -> async [TokenId];
+
+    // Controller management
+    add_controller : (Principal) -> async CandidResult<(), Text>;
   };
 
   // ===== MARKET TYPES =====
@@ -422,11 +425,44 @@ persistent actor TokenFactory {
         resolver : Principal;
         expiry : Nat64;
         totalSupply : Nat64;
-        b : Float;
+        bondingCurve : {
+          basePrice : Nat64;
+          priceSlope : Nat64;
+        };
       };
       ledger : Principal;
       yesTokenId : TokenId;
       noTokenId : TokenId;
+    }) -> async Result.Result<{ marketId : Nat; vaultConfig : VaultAddressConfig; setupComplete : Bool }, Text>;
+
+    registerMultipleChoiceMarketWithVault : shared ({
+      base : {
+        question : Text;
+        resolver : Principal;
+        expiry : Nat64;
+        totalSupply : Nat64;
+        bondingCurve : {
+          basePrice : Nat64;
+          priceSlope : Nat64;
+        };
+      };
+      ledger : Principal;
+      outcomes : [(Text, TokenId)];
+    }) -> async Result.Result<{ marketId : Nat; vaultConfig : VaultAddressConfig; setupComplete : Bool }, Text>;
+
+    registerCompoundMarketWithVault : shared ({
+      base : {
+        question : Text;
+        resolver : Principal;
+        expiry : Nat64;
+        totalSupply : Nat64;
+        bondingCurve : {
+          basePrice : Nat64;
+          priceSlope : Nat64;
+        };
+      };
+      ledger : Principal;
+      subjects : [(Text, { yesTokenId : TokenId; noTokenId : TokenId })];
     }) -> async Result.Result<{ marketId : Nat; vaultConfig : VaultAddressConfig; setupComplete : Bool }, Text>;
   };
 
@@ -459,9 +495,18 @@ persistent actor TokenFactory {
 
           Debug.print("Creating ICRC-151 ledger canister...");
 
+          // Include MarketTrade canister as controller so it can mint tokens
+          let controllers = switch (marketsCanister) {
+            case (?markets) {
+              Debug.print("Including MarketTrade " # Principal.toText(markets) # " as controller");
+              [Principal.fromActor(TokenFactory), markets];
+            };
+            case (null) { [Principal.fromActor(TokenFactory)] };
+          };
+
           let createResult = await (with cycles = CYCLES_PER_LEDGER) mgmt.create_canister({
             settings = ?{
-              controllers = [Principal.fromActor(TokenFactory)];
+              controllers = controllers;
             };
           });
 
@@ -479,9 +524,25 @@ persistent actor TokenFactory {
 
           Debug.print("ICRC-151 ledger installed successfully");
 
-          // Add TokenFactory as controller of the ledger
-          let ledger : ICRC151Interface = actor (Principal.toText(ledgerId));
-          // Note: add_controller is in the candid but we'll skip for now since we're already the controller
+          // Add MarketTrade as internal controller on ICRC-151 ledger so it can mint tokens
+          switch (marketsCanister) {
+            case (?markets) {
+              let ledger : ICRC151Interface = actor (Principal.toText(ledgerId));
+              Debug.print("Adding MarketTrade as ICRC-151 internal controller: " # Principal.toText(markets));
+              let addResult = await ledger.add_controller(markets);
+              switch (addResult) {
+                case (#Ok) {
+                  Debug.print("MarketTrade added as ICRC-151 controller successfully");
+                };
+                case (#Err(e)) {
+                  Debug.print("Warning: Failed to add MarketTrade as controller: " # e);
+                };
+              };
+            };
+            case (null) {
+              Debug.print("Warning: Markets canister not set, only TokenFactory can mint");
+            };
+          };
 
           createdLedgers := Array.append(createdLedgers, [ledgerId]);
 
@@ -631,6 +692,7 @@ persistent actor TokenFactory {
     Debug.print("========================================");
 
     // Register the market with the MarkeTrade canister if configured
+    var internalMarketId = marketId;
     switch (marketsCanister) {
       case (null) {
         Debug.print("Note: Markets canister not configured, skipping registration");
@@ -645,7 +707,10 @@ persistent actor TokenFactory {
               resolver = caller;
               expiry = Nat64.fromNat(Int.abs(args.expirationTime));
               totalSupply = 1_000_000_000_000 : Nat64; // 1 trillion satoshis
-              b = 10000.0; // AMM b parameter
+              bondingCurve = {
+                basePrice = 1000;
+                priceSlope = 1;
+              };
             };
             ledger = ledger;
             yesTokenId = yesTokenId;
@@ -654,6 +719,7 @@ persistent actor TokenFactory {
           switch (regResult) {
             case (#ok(result)) {
               Debug.print("✓ Market registered with MarkeTrade. Internal ID: " # Nat.toText(result.marketId));
+              internalMarketId := result.marketId;
             };
             case (#err(e)) {
               Debug.print("⚠ Failed to register with MarkeTrade: " # e);
@@ -665,7 +731,7 @@ persistent actor TokenFactory {
       };
     };
 
-    #ok(marketId);
+    #ok(internalMarketId);
   };
 
   public shared ({ caller }) func createMultipleChoiceMarket(
@@ -763,7 +829,46 @@ persistent actor TokenFactory {
     Debug.print("Cycle savings: " # Nat.toText(savedCycles));
     Debug.print("========================================");
 
-    #ok(marketId);
+    // Register with MarketTrade
+    var internalMarketId = marketId;
+    switch (marketsCanister) {
+      case (null) {
+        Debug.print("Note: Markets canister not configured, skipping registration");
+      };
+      case (?marketsId) {
+        Debug.print("Registering Multiple Choice market with MarkeTrade canister...");
+        let marketsActor : MarketsInterface = actor (Principal.toText(marketsId));
+        try {
+          let regResult = await marketsActor.registerMultipleChoiceMarketWithVault({
+            base = {
+              question = args.title;
+              resolver = caller;
+              expiry = Nat64.fromNat(Int.abs(args.expirationTime));
+              totalSupply = 1_000_000_000_000 : Nat64;
+              bondingCurve = {
+                basePrice = 100;
+                priceSlope = 1;
+              };
+            };
+            ledger = ledger;
+            outcomes = outcomeTokens;
+          });
+          switch (regResult) {
+            case (#ok(result)) {
+              Debug.print("✓ Multiple Choice Market registered with MarkeTrade. Internal ID: " # Nat.toText(result.marketId));
+              internalMarketId := result.marketId;
+            };
+            case (#err(e)) {
+              Debug.print("⚠ Failed to register with MarkeTrade: " # e);
+            };
+          };
+        } catch (e) {
+          Debug.print("⚠ Error calling MarkeTrade: " # Error.message(e));
+        };
+      };
+    };
+
+    #ok(internalMarketId);
   };
 
   public shared ({ caller }) func createCompoundMarket(
@@ -875,7 +980,46 @@ persistent actor TokenFactory {
     Debug.print("Cycle savings: " # Nat.toText(savedCycles));
     Debug.print("========================================");
 
-    #ok(marketId);
+    // Register with MarketTrade
+    var internalMarketId = marketId;
+    switch (marketsCanister) {
+      case (null) {
+        Debug.print("Note: Markets canister not configured, skipping registration");
+      };
+      case (?marketsId) {
+        Debug.print("Registering Compound market with MarkeTrade canister...");
+        let marketsActor : MarketsInterface = actor (Principal.toText(marketsId));
+        try {
+          let regResult = await marketsActor.registerCompoundMarketWithVault({
+            base = {
+              question = args.title;
+              resolver = caller;
+              expiry = Nat64.fromNat(Int.abs(args.expirationTime));
+              totalSupply = 1_000_000_000_000 : Nat64;
+              bondingCurve = {
+                basePrice = 100;
+                priceSlope = 1;
+              };
+            };
+            ledger = ledger;
+            subjects = subjectTokens;
+          });
+          switch (regResult) {
+            case (#ok(result)) {
+              Debug.print("✓ Compound Market registered with MarkeTrade. Internal ID: " # Nat.toText(result.marketId));
+              internalMarketId := result.marketId;
+            };
+            case (#err(e)) {
+              Debug.print("⚠ Failed to register with MarkeTrade: " # e);
+            };
+          };
+        } catch (e) {
+          Debug.print("⚠ Error calling MarkeTrade: " # Error.message(e));
+        };
+      };
+    };
+
+    #ok(internalMarketId);
   };
 
   // ===== QUERY FUNCTIONS =====

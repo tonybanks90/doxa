@@ -61,26 +61,58 @@ persistent actor Markets {
     };
   };
 
+  // ===== BONDING CURVE TYPES =====
+
+  public type BondingCurveParams = {
+    basePrice : Nat64;
+    priceSlope : Nat64;
+  };
+
+  // Bonding curve parameters for each outcome
+  public type BondingCurveConfig = {
+    basePrice : Nat64; // Starting price in satoshis (e.g., 1000)
+    priceSlope : Nat64; // Price increase per share (e.g., 50)
+    currentSupply : Nat64; // Current shares minted for this outcome
+    poolBalance : Nat64; // Total satoshis in this outcome's pool
+  };
+
+  // Holder position with stake tracking for parimutuel payouts
+  public type HolderPosition = {
+    shares : Nat64; // Number of shares held
+    totalPaid : Nat64; // Total satoshis invested
+    claimed : Bool; // Whether winnings have been claimed
+  };
+
+  // Claim result type
+  public type ClaimResult = {
+    stakeReturned : Nat64; // Original stake returned
+    winningsFromLosingPool : Nat64; // Share of losing pool
+    totalPayout : Nat64; // Total amount paid out
+  };
+
   // Market-specific configurations
   public type BinaryMarketConfig = {
     ledger : Principal;
     yesTokenId : TokenId;
     noTokenId : TokenId;
-    qYes : Float; // YES inventory
-    qNo : Float; // NO inventory
+    qYes : Float; // YES inventory (legacy LMSR)
+    qNo : Float; // NO inventory (legacy LMSR)
+    // NEW: Bonding curve configs per outcome
+    yesCurve : ?BondingCurveConfig;
+    noCurve : ?BondingCurveConfig;
   };
 
   public type MultipleChoiceConfig = {
     ledger : Principal;
     outcomes : [(Text, TokenId)]; // outcome name -> token id
-    inventories : [(Text, Float)]; // outcome name -> inventory
+    outcomeCurves : [(Text, BondingCurveConfig)]; // outcome name -> curve
   };
 
   public type CompoundSubjectConfig = {
     yesTokenId : TokenId;
     noTokenId : TokenId;
-    qYes : Float;
-    qNo : Float;
+    yesCurve : ?BondingCurveConfig;
+    noCurve : ?BondingCurveConfig;
   };
 
   public type CompoundConfig = {
@@ -96,7 +128,7 @@ persistent actor Markets {
     resolver : Principal;
     expiry : Nat64;
     ledger : Principal; // Main ledger for the market
-    b : Float; // LMSR liquidity parameter
+    // b removed (LMSR)
     resolved : ?MarketResolution; // Enhanced resolution structure
     active : Bool;
     totalVolumeSatoshis : Nat64; // Total satoshi volume traded
@@ -116,7 +148,7 @@ persistent actor Markets {
     question : Text;
     resolver : Principal;
     expiry : Nat64;
-    b : Float; // LMSR liquidity parameter
+    bondingCurve : BondingCurveParams;
     totalSupply : Nat64; // Maximum tokens mintable
   };
 
@@ -186,6 +218,13 @@ persistent actor Markets {
   public type HolderBalance = {
     user : Principal;
     balance : Float;
+  };
+
+  // Extended holder info for parimutuel markets
+  public type ExtendedHolderInfo = {
+    user : Principal;
+    outcome : TokenIdentifier;
+    position : HolderPosition;
   };
 
   // ICRC-1 Ledger Interface (for ckBTC)
@@ -422,9 +461,14 @@ persistent actor Markets {
   private transient var marketTransactions : TrieMap.TrieMap<Nat, Buffer.Buffer<MarketTransaction>> = TrieMap.TrieMap<Nat, Buffer.Buffer<MarketTransaction>>(Nat.equal, func(n : Nat) : Nat32 { Nat32.fromNat(n) });
   stable var nextTxId : Nat = 1;
 
-  // Holder State (MarketId -> Principal -> Balance)
+  // Holder State (MarketId -> Principal -> Balance) - Legacy
   stable var marketHoldersEntries : [(Nat, Principal, Float)] = [];
   private transient var marketHolders : TrieMap.TrieMap<Nat, TrieMap.TrieMap<Principal, Float>> = TrieMap.TrieMap<Nat, TrieMap.TrieMap<Principal, Float>>(Nat.equal, func(n : Nat) : Nat32 { Nat32.fromNat(n) });
+
+  // NEW: Holder Positions with stake tracking (MarketId -> "YES"/"NO" -> Principal -> HolderPosition)
+  // Using Text key for outcome: "YES" or "NO"
+  stable var holderPositionsEntries : [(Nat, Text, Principal, HolderPosition)] = [];
+  private transient var holderPositions : TrieMap.TrieMap<Nat, TrieMap.TrieMap<Text, TrieMap.TrieMap<Principal, HolderPosition>>> = TrieMap.TrieMap<Nat, TrieMap.TrieMap<Text, TrieMap.TrieMap<Principal, HolderPosition>>>(Nat.equal, func(n : Nat) : Nat32 { Nat32.fromNat(n) });
 
   stable var nextMarketId : Nat = 1;
 
@@ -485,8 +529,12 @@ persistent actor Markets {
       return #err("Expiry must be in the future");
     };
 
-    if (args.b <= 0.0) {
-      return #err("Liquidity parameter b must be positive");
+    if (args.bondingCurve.basePrice == 0) {
+      return #err("Base price must be positive");
+    };
+
+    if (args.bondingCurve.priceSlope == 0) {
+      return #err("Price slope must be positive");
     };
 
     if (args.totalSupply == 0) {
@@ -669,9 +717,122 @@ persistent actor Markets {
 
   // ===== END OF HELPER FUNCTIONS =====
 
-  // Now the LMSR Math section continues normally...
+  // ===== BONDING CURVE MATH =====
+  // Linear bonding curve: Price = basePrice + (priceSlope × currentSupply)
+  // Cost for n shares = n × (basePrice + priceSlope × (currentSupply + n/2))
 
-  // ===== LMSR MATH =====
+  // Calculate current price on bonding curve
+  private func calculateBondingCurvePrice(curve : BondingCurveConfig) : Nat64 {
+    curve.basePrice + (curve.priceSlope * curve.currentSupply);
+  };
+
+  // Calculate how many shares can be bought for a given amount of satoshis
+  // Using quadratic formula: cost = n * (basePrice + slope * (supply + n/2))
+  // Rearranged: slope/2 * n² + (basePrice + slope*supply) * n - cost = 0
+  private func calculateBondingCurveShares(curve : BondingCurveConfig, amountSatoshis : Nat64) : Nat64 {
+    let base = curve.basePrice;
+    let slope = curve.priceSlope;
+    let supply = curve.currentSupply;
+    let cost = amountSatoshis;
+
+    // For very small slope, use simple linear approximation
+    if (slope == 0) {
+      if (base == 0) { return 0 };
+      return cost / base;
+    };
+
+    // Quadratic formula: n = (-b + sqrt(b² + 2*a*c)) / a
+    // where a = slope, b = basePrice + slope*supply, c = cost
+    let a = Nat64.toNat(slope);
+    let b = Nat64.toNat(base + slope * supply);
+    let c = Nat64.toNat(cost);
+
+    // Calculate discriminant: b² + 2*a*c
+    let bSquared = b * b;
+    let twoAC = 2 * a * c;
+    let discriminant = bSquared + twoAC;
+
+    // Integer square root approximation
+    let sqrtDisc = natSqrt(discriminant);
+
+    // n = (-b + sqrt) / a  (taking positive root)
+    if (sqrtDisc <= b) { return 0 };
+    let result = (sqrtDisc - b) / a;
+
+    Nat64.fromNat(result);
+  };
+
+  // Calculate cost for a specific number of shares
+  private func calculateBondingCurveCost(curve : BondingCurveConfig, shares : Nat64) : Nat64 {
+    let base = curve.basePrice;
+    let slope = curve.priceSlope;
+    let supply = curve.currentSupply;
+
+    // Cost = shares × (basePrice + slope × (currentSupply + shares/2))
+    let avgPriceComponent = base + slope * supply + (slope * shares) / 2;
+    shares * avgPriceComponent;
+  };
+
+  // Integer square root using Newton's method
+  private func natSqrt(n : Nat) : Nat {
+    if (n == 0) { return 0 };
+    var x = n;
+    var y = (x + 1) / 2;
+    while (y < x) {
+      x := y;
+      y := (x + n / x) / 2;
+    };
+    x;
+  };
+
+  // Get or create holder position for a market/outcome/user
+  private func getOrCreateHolderPosition(marketId : Nat, outcomeKey : Text, user : Principal) : HolderPosition {
+    switch (holderPositions.get(marketId)) {
+      case (null) {
+        { shares = 0; totalPaid = 0; claimed = false };
+      };
+      case (?outcomeMap) {
+        switch (outcomeMap.get(outcomeKey)) {
+          case (null) {
+            { shares = 0; totalPaid = 0; claimed = false };
+          };
+          case (?userMap) {
+            switch (userMap.get(user)) {
+              case (null) { { shares = 0; totalPaid = 0; claimed = false } };
+              case (?pos) { pos };
+            };
+          };
+        };
+      };
+    };
+  };
+
+  // Update holder position
+  private func updateHolderPosition(marketId : Nat, outcomeKey : Text, user : Principal, newPosition : HolderPosition) {
+    let outcomeMap = switch (holderPositions.get(marketId)) {
+      case (null) {
+        let m = TrieMap.TrieMap<Text, TrieMap.TrieMap<Principal, HolderPosition>>(Text.equal, Text.hash);
+        holderPositions.put(marketId, m);
+        m;
+      };
+      case (?m) { m };
+    };
+
+    let userMap = switch (outcomeMap.get(outcomeKey)) {
+      case (null) {
+        let m = TrieMap.TrieMap<Principal, HolderPosition>(Principal.equal, Principal.hash);
+        outcomeMap.put(outcomeKey, m);
+        m;
+      };
+      case (?m) { m };
+    };
+
+    userMap.put(user, newPosition);
+  };
+
+  // ===== LMSR MATH (Legacy) =====
+
+  // Now the LMSR Math section continues normally...
 
   // Binary market LMSR functions
   private func costFunction(qYes : Float, qNo : Float, b : Float) : Float {
@@ -985,6 +1146,21 @@ persistent actor Markets {
       noTokenId = args.noTokenId;
       qYes = 0.0;
       qNo = 0.0;
+      // Initialize bonding curves with parameters for reasonable slippage
+      // basePrice: 100 sats (starting price per share)
+      // priceSlope: 5 sats per share (gradual ~5% price increase per 100 shares)
+      yesCurve = ?{
+        basePrice = args.base.bondingCurve.basePrice;
+        priceSlope = args.base.bondingCurve.priceSlope;
+        currentSupply = 0 : Nat64;
+        poolBalance = 0 : Nat64;
+      };
+      noCurve = ?{
+        basePrice = args.base.bondingCurve.basePrice;
+        priceSlope = args.base.bondingCurve.priceSlope;
+        currentSupply = 0 : Nat64;
+        poolBalance = 0 : Nat64;
+      };
     };
 
     let market : MarketState = {
@@ -994,7 +1170,6 @@ persistent actor Markets {
       resolver = args.base.resolver;
       expiry = args.base.expiry;
       ledger = args.ledger;
-      b = args.base.b;
       resolved = null;
       active = true;
       totalVolumeSatoshis = 0;
@@ -1093,16 +1268,24 @@ persistent actor Markets {
     let marketId = nextMarketId;
     nextMarketId += 1;
 
-    // Initialize inventories at 0
-    let inventories = Array.map<(Text, TokenId), (Text, Float)>(
+    // Initialize bonding curves
+    let outcomeCurves = Array.map<(Text, TokenId), (Text, BondingCurveConfig)>(
       args.outcomes,
-      func((name, _)) = (name, 0.0),
+      func((name, _)) = (
+        name,
+        {
+          basePrice = args.base.bondingCurve.basePrice;
+          priceSlope = args.base.bondingCurve.priceSlope;
+          currentSupply = 0;
+          poolBalance = 0;
+        },
+      ),
     );
 
     let multipleChoiceConfig : MultipleChoiceConfig = {
       ledger = args.ledger;
       outcomes = args.outcomes;
-      inventories = inventories;
+      outcomeCurves = outcomeCurves;
     };
 
     let market : MarketState = {
@@ -1112,7 +1295,6 @@ persistent actor Markets {
       resolver = args.base.resolver;
       expiry = args.base.expiry;
       ledger = args.ledger;
-      b = args.base.b;
       resolved = null;
       active = true;
       totalVolumeSatoshis = 0;
@@ -1225,8 +1407,18 @@ persistent actor Markets {
         {
           yesTokenId = tokens.yesTokenId;
           noTokenId = tokens.noTokenId;
-          qYes = 0.0;
-          qNo = 0.0;
+          yesCurve = ?{
+            basePrice = args.base.bondingCurve.basePrice;
+            priceSlope = args.base.bondingCurve.priceSlope;
+            currentSupply = 0;
+            poolBalance = 0;
+          };
+          noCurve = ?{
+            basePrice = args.base.bondingCurve.basePrice;
+            priceSlope = args.base.bondingCurve.priceSlope;
+            currentSupply = 0;
+            poolBalance = 0;
+          };
         },
       ),
     );
@@ -1243,7 +1435,6 @@ persistent actor Markets {
       resolver = args.base.resolver;
       expiry = args.base.expiry;
       ledger = args.ledger;
-      b = args.base.b;
       resolved = null;
       active = true;
       totalVolumeSatoshis = 0;
@@ -1339,40 +1530,17 @@ persistent actor Markets {
     };
   };
 
-  // Universal sell function for all market types
+  // Universal sell function - DISABLED for bonding curve parimutuel markets
+  // Per target spec: "Selling is not supported in bonding curve markets.
+  //   Positions are locked until market resolution.
+  //   Please wait for market resolution to claim your winnings."
   public shared (msg) func sellTokens(
     marketId : Nat,
     tokenIdentifier : TokenIdentifier,
     amountTokens : Nat64,
     minPrice : Nat64,
   ) : async Result.Result<SellResult, Text> {
-
-    switch (markets.get(marketId)) {
-      case (null) { return #err("Market not found") };
-      case (?market) {
-        // Common validations
-        if (not market.active) { return #err("Market not active") };
-        if (market.resolved != null) { return #err("Market resolved") };
-        if (Nat64.fromNat(Int.abs(Time.now())) >= market.expiry) {
-          return #err("Market expired");
-        };
-        if (not market.vaultRegistered) { return #err("Vault not registered") };
-        if (amountTokens == 0) { return #err("Amount must be greater than 0") };
-
-        // Route to appropriate handler
-        switch (market.marketType) {
-          case (#Binary) {
-            await sellBinaryTokens(market, tokenIdentifier, amountTokens, minPrice, msg.caller);
-          };
-          case (#MultipleChoice) {
-            await sellMultipleChoiceTokens(market, tokenIdentifier, amountTokens, minPrice, msg.caller);
-          };
-          case (#Compound) {
-            await sellCompoundTokens(market, tokenIdentifier, amountTokens, minPrice, msg.caller);
-          };
-        };
-      };
-    };
+    #err("Selling is not supported in bonding curve markets. Positions are locked until market resolution. Please wait for market resolution to claim your winnings.");
   };
 
   // ===== BINARY MARKET TRADING =====
@@ -1395,70 +1563,84 @@ persistent actor Markets {
       case (?config) { config };
     };
 
-    let qYes = binaryConfig.qYes;
-    let qNo = binaryConfig.qNo;
-    let b = market.b;
-
-    // Calculate current price for slippage check
-    let currentPrice = calculatePrice(qYes, qNo, b, binaryToken);
-
-    // Calculate tokens to receive using LMSR
-    let costInFloat = satoshisToFloat(amountSatoshis);
-    let tokensToReceive = calculateTokensForCost(qYes, qNo, b, binaryToken, costInFloat);
-
-    if (tokensToReceive <= 0.0) {
-      return #err("Invalid token calculation");
+    // Get the appropriate bonding curve and outcome key
+    let (curve, outcomeKey, tokenId) = switch (binaryToken) {
+      case (#YES) {
+        let c = switch (binaryConfig.yesCurve) {
+          case (null) { return #err("YES bonding curve not configured") };
+          case (?c) { c };
+        };
+        (c, "YES", binaryConfig.yesTokenId);
+      };
+      case (#NO) {
+        let c = switch (binaryConfig.noCurve) {
+          case (null) { return #err("NO bonding curve not configured") };
+          case (?c) { c };
+        };
+        (c, "NO", binaryConfig.noTokenId);
+      };
     };
 
-    // Calculate new price after purchase for slippage check
-    let (newQYes, newQNo) = switch (binaryToken) {
-      case (#YES) { (qYes + tokensToReceive, qNo) };
-      case (#NO) { (qYes, qNo + tokensToReceive) };
-    };
-    let newPrice = calculatePrice(newQYes, newQNo, b, binaryToken);
+    // Calculate shares using bonding curve
+    let sharesToReceive = calculateBondingCurveShares(curve, amountSatoshis);
 
-    // Check slippage
-    let priceIncrease = if (currentPrice > 0.0) {
-      (newPrice - currentPrice) / currentPrice;
-    } else { 0.0 };
-    if (priceIncrease > maxSlippage) {
-      return #err("Price slippage too high: " # Float.toText(priceIncrease * 100.0) # "%");
+    if (sharesToReceive == 0) {
+      return #err("Amount too small to receive any shares");
     };
 
-    // Execute financial operations
+    // Calculate actual cost
+    let actualCost = calculateBondingCurveCost(curve, sharesToReceive);
+
+    // Slippage protection for bonding curves:
+    // Compare expected shares (based on current supply) vs actual shares received
+    // If someone front-runs, supply increases and we get fewer shares
+    // maxSlippage is the max % decrease in shares we're willing to accept
+    // E.g., 0.1 = 10% slippage tolerance = accept up to 10% fewer shares than quoted
+
+    // Calculate expected average price per share
+    let newSupply = curve.currentSupply + sharesToReceive;
+    let newCurve = { curve with currentSupply = newSupply };
+    let newPrice = calculateBondingCurvePrice(newCurve);
+
+    // Slippage Check (Limit Price)
+    if (satoshisToFloat(newPrice) > maxSlippage) {
+      return #err("Price slippage too high");
+    };
+
+    // Execute financial operations - pull satoshis from user
     switch (await pullSatoshisFromMarketVault(market.id, caller, amountSatoshis, tokenIdentifier)) {
       case (#err(error)) { return #err("Failed to pull satoshis: " # error) };
       case (#ok()) {};
     };
 
     // Mint tokens using ICRC-151
-    let tokenId = switch (binaryToken) {
-      case (#YES) { binaryConfig.yesTokenId };
-      case (#NO) { binaryConfig.noTokenId };
-    };
-
-    let tokensToMint = floatToSatoshis(tokensToReceive);
-    switch (await mintTokens(binaryConfig.ledger, tokenId, caller, tokensToMint)) {
+    switch (await mintTokens(binaryConfig.ledger, tokenId, caller, sharesToReceive)) {
       case (#err(error)) {
+        // Rollback: refund satoshis
         ignore await paySatoshisFromMarketVault(market.id, caller, amountSatoshis, tokenIdentifier);
         return #err("Failed to mint tokens: " # error);
       };
       case (#ok()) {};
     };
 
-    // Update compound market state - only update specific subject
-    // Update binary market state
-    let updatedBinaryConfig = {
-      binaryConfig with
-      qYes = newQYes;
-      qNo = newQNo;
+    // Update bonding curve state
+    let updatedCurve : BondingCurveConfig = {
+      basePrice = curve.basePrice;
+      priceSlope = curve.priceSlope;
+      currentSupply = newSupply;
+      poolBalance = curve.poolBalance + amountSatoshis;
+    };
+
+    let updatedBinaryConfig = switch (binaryToken) {
+      case (#YES) { { binaryConfig with yesCurve = ?updatedCurve } };
+      case (#NO) { { binaryConfig with noCurve = ?updatedCurve } };
     };
 
     let updatedMarket = {
       market with
       binaryConfig = ?updatedBinaryConfig;
       totalVolumeSatoshis = market.totalVolumeSatoshis + amountSatoshis;
-      currentSupply = market.currentSupply + tokensToMint;
+      currentSupply = market.currentSupply + sharesToReceive;
     };
 
     markets.put(market.id, updatedMarket);
@@ -1473,9 +1655,9 @@ persistent actor Markets {
       user = caller;
       operation = #Buy;
       tokenIdentifier = tokenIdentifier;
-      amount = tokensToReceive;
-      price = newPrice;
-      cost = Nat64.toNat(amountSatoshis); // Ensure type match
+      amount = satoshisToFloat(sharesToReceive);
+      price = satoshisToFloat(newPrice);
+      cost = Nat64.toNat(amountSatoshis);
       timestamp = Nat64.fromNat(Int.abs(Time.now()));
     };
 
@@ -1489,7 +1671,7 @@ persistent actor Markets {
     };
     txList.add(tx);
 
-    // Update Holders
+    // Update legacy holder balance for backward compatibility
     let userMap = switch (marketHolders.get(market.id)) {
       case (null) {
         let m = TrieMap.TrieMap<Principal, Float>(Principal.equal, Principal.hash);
@@ -1499,14 +1681,23 @@ persistent actor Markets {
       case (?m) { m };
     };
     let currentBal = Option.get(userMap.get(caller), 0.0);
-    userMap.put(caller, currentBal + tokensToReceive);
+    userMap.put(caller, currentBal + satoshisToFloat(sharesToReceive));
 
-    // End Record Logic
+    // NEW: Update holder position with stake tracking for parimutuel payouts
+    let currentPosition = getOrCreateHolderPosition(market.id, outcomeKey, caller);
+    let updatedPosition : HolderPosition = {
+      shares = currentPosition.shares + sharesToReceive;
+      totalPaid = currentPosition.totalPaid + amountSatoshis;
+      claimed = false;
+    };
+    updateHolderPosition(market.id, outcomeKey, caller, updatedPosition);
+
+    Debug.print("User " # Principal.toText(caller) # " bought " # Nat64.toText(sharesToReceive) # " " # outcomeKey # " shares for " # Nat64.toText(amountSatoshis) # " sats");
 
     #ok({
-      tokensReceived = tokensToReceive;
+      tokensReceived = satoshisToFloat(sharesToReceive);
       actualCostSatoshis = amountSatoshis;
-      newPrice = newPrice;
+      newPrice = satoshisToFloat(newPrice);
     });
   };
 
@@ -1519,90 +1710,7 @@ persistent actor Markets {
     minPrice : Nat64,
     caller : Principal,
   ) : async Result.Result<SellResult, Text> {
-
-    let binaryToken = switch (tokenIdentifier) {
-      case (#Binary(token)) { token };
-      case (_) { return #err("Invalid token identifier for binary market") };
-    };
-
-    let binaryConfig = switch (market.binaryConfig) {
-      case (null) { return #err("Binary configuration missing") };
-      case (?config) { config };
-    };
-
-    // Check token balance using ICRC-151
-    let tokenId = switch (binaryToken) {
-      case (#YES) { binaryConfig.yesTokenId };
-      case (#NO) { binaryConfig.noTokenId };
-    };
-
-    switch (await getTokenBalance(binaryConfig.ledger, tokenId, caller)) {
-      case (#err(error)) { return #err("Failed to check balance: " # error) };
-      case (#ok(balance)) {
-        if (balance < amountTokens) {
-          return #err("Insufficient token balance");
-        };
-      };
-    };
-
-    // Calculate satoshis to receive (negative tokens = selling)
-    let tokensInFloat = satoshisToFloat(amountTokens);
-    let satoshisToReceive = calculateCostForTokens(
-      binaryConfig.qYes,
-      binaryConfig.qNo,
-      market.b,
-      binaryToken,
-      -tokensInFloat,
-    );
-
-    let satoshiAmount = floatToSatoshis(satoshisToReceive);
-
-    // Check minimum price
-    if (satoshiAmount < minPrice) {
-      return #err("Price below minimum acceptable");
-    };
-
-    // Execute burn and payment
-    switch (await burnTokens(binaryConfig.ledger, tokenId, caller, amountTokens)) {
-      case (#err(error)) { return #err("Failed to burn tokens: " # error) };
-      case (#ok()) {};
-    };
-
-    switch (await paySatoshisFromMarketVault(market.id, caller, satoshiAmount, tokenIdentifier)) {
-      case (#err(error)) {
-        ignore await mintTokens(binaryConfig.ledger, tokenId, caller, amountTokens);
-        return #err("Failed to pay satoshis: " # error);
-      };
-      case (#ok()) {};
-    };
-
-    // Update binary market state
-    let (newQYes, newQNo) = switch (binaryToken) {
-      case (#YES) { (binaryConfig.qYes - tokensInFloat, binaryConfig.qNo) };
-      case (#NO) { (binaryConfig.qYes, binaryConfig.qNo - tokensInFloat) };
-    };
-
-    let updatedBinaryConfig = {
-      binaryConfig with
-      qYes = newQYes;
-      qNo = newQNo;
-    };
-
-    let updatedMarket = {
-      market with
-      binaryConfig = ?updatedBinaryConfig;
-      totalVolumeSatoshis = market.totalVolumeSatoshis + satoshiAmount;
-      currentSupply = market.currentSupply - amountTokens;
-    };
-
-    markets.put(market.id, updatedMarket);
-
-    let newPrice = calculatePrice(newQYes, newQNo, market.b, binaryToken);
-
-    #ok({
-      satoshisReceived = satoshiAmount;
-      newPrice = newPrice;
-    });
+    #err("Selling not supported. Please await market resolution.");
   };
 
   // ===== MULTIPLE CHOICE MARKET TRADING =====
@@ -1627,67 +1735,75 @@ persistent actor Markets {
       case (?config) { config };
     };
 
-    // Validate outcome exists using ICRC-151
-    let tokenId = switch (getTokenIdForOutcome(config.outcomes, outcomeName)) {
-      case (null) { return #err("Outcome not found: " # outcomeName) };
-      case (?id) { id };
+    // Find curve
+    let curve = switch (Array.find<(Text, BondingCurveConfig)>(config.outcomeCurves, func((n, _)) = n == outcomeName)) {
+      case (null) { return #err("Curve not found for outcome: " # outcomeName) };
+      case (?(_, c)) { c };
     };
 
-    // Calculate tokens and price impact
-    let currentPrice = calculateMultipleChoicePrice(config.inventories, market.b, outcomeName);
-    let costInFloat = satoshisToFloat(amountSatoshis);
-    let tokensToReceive = calculateMultipleChoiceTokensForCost(
-      config.inventories,
-      market.b,
-      outcomeName,
-      costInFloat,
-    );
+    // Calculate shares using bonding curve
+    let shares = calculateBondingCurveShares(curve, amountSatoshis);
+    if (shares == 0) return #err("Amount too small");
 
-    // Calculate new price for slippage check
-    let newInventories = updateInventory(config.inventories, outcomeName, tokensToReceive);
-    let newPrice = calculateMultipleChoicePrice(newInventories, market.b, outcomeName);
+    // Calculate slippage & new price
+    let currentPrice = calculateBondingCurvePrice(curve);
+    let newSupply = curve.currentSupply + shares;
+    let newCurve = { curve with currentSupply = newSupply };
+    let newPrice = calculateBondingCurvePrice(newCurve);
 
-    let priceIncrease = if (currentPrice > 0.0) {
-      (newPrice - currentPrice) / currentPrice;
-    } else { 0.0 };
-    if (priceIncrease > maxSlippage) {
-      return #err("Price slippage too high: " # Float.toText(priceIncrease * 100.0) # "%");
+    // Slippage Check (Limit Price)
+    if (satoshisToFloat(newPrice) > maxSlippage) {
+      return #err("Price slippage too high");
     };
 
-    // Execute financial operations
+    // Financials
     switch (await pullSatoshisFromMarketVault(market.id, caller, amountSatoshis, tokenIdentifier)) {
-      case (#err(error)) { return #err("Failed to pull satoshis: " # error) };
+      case (#err(e)) { return #err("Failed to pull satoshis: " # e) };
       case (#ok()) {};
     };
 
-    let tokensToMint = floatToSatoshis(tokensToReceive);
-    switch (await mintTokens(config.ledger, tokenId, caller, tokensToMint)) {
-      case (#err(error)) {
+    let tokenId = switch (getTokenIdForOutcome(config.outcomes, outcomeName)) {
+      case (null) { return #err("Token ID not found") };
+      case (?id) { id };
+    };
+
+    switch (await mintTokens(config.ledger, tokenId, caller, shares)) {
+      case (#err(e)) {
         ignore await paySatoshisFromMarketVault(market.id, caller, amountSatoshis, tokenIdentifier);
-        return #err("Failed to mint tokens: " # error);
+        return #err("Failed to mint: " # e);
       };
       case (#ok()) {};
     };
 
-    // Update market state
-    let updatedConfig = {
-      config with
-      inventories = newInventories;
+    // Update State
+    let updatedCurve : BondingCurveConfig = {
+      curve with
+      currentSupply = newSupply;
+      poolBalance = curve.poolBalance + amountSatoshis;
     };
 
+    let updatedCurves = Array.map<(Text, BondingCurveConfig), (Text, BondingCurveConfig)>(
+      config.outcomeCurves,
+      func((n, c)) = if (n == outcomeName) (n, updatedCurve) else (n, c),
+    );
+
+    let updatedConfig = { config with outcomeCurves = updatedCurves };
     let updatedMarket = {
       market with
       multipleChoiceConfig = ?updatedConfig;
       totalVolumeSatoshis = market.totalVolumeSatoshis + amountSatoshis;
-      currentSupply = market.currentSupply + tokensToMint;
+      currentSupply = market.currentSupply + shares;
     };
-
     markets.put(market.id, updatedMarket);
 
+    // Record Tx & Parimutuel Position
+    recordBuyTransaction(updatedMarket, caller, tokenIdentifier, shares, amountSatoshis, newPrice);
+    updateParimutuelPosition(market.id, outcomeName, caller, shares, amountSatoshis);
+
     #ok({
-      tokensReceived = tokensToReceive;
+      tokensReceived = satoshisToFloat(shares);
       actualCostSatoshis = amountSatoshis;
-      newPrice = newPrice;
+      newPrice = satoshisToFloat(newPrice);
     });
   };
 
@@ -1698,84 +1814,7 @@ persistent actor Markets {
     minPrice : Nat64,
     caller : Principal,
   ) : async Result.Result<SellResult, Text> {
-
-    let outcomeName = switch (tokenIdentifier) {
-      case (#Outcome(name)) { name };
-      case (_) {
-        return #err("Invalid token identifier for multiple choice market");
-      };
-    };
-
-    let config = switch (market.multipleChoiceConfig) {
-      case (null) { return #err("Multiple choice configuration missing") };
-      case (?config) { config };
-    };
-
-    // Validate outcome exists and get token ID using ICRC-151
-    let tokenId = switch (getTokenIdForOutcome(config.outcomes, outcomeName)) {
-      case (null) { return #err("Outcome not found: " # outcomeName) };
-      case (?id) { id };
-    };
-
-    // Check token balance
-    switch (await getTokenBalance(config.ledger, tokenId, caller)) {
-      case (#err(error)) { return #err("Failed to check balance: " # error) };
-      case (#ok(balance)) {
-        if (balance < amountTokens) {
-          return #err("Insufficient token balance");
-        };
-      };
-    };
-
-    // Calculate satoshis to receive (negative tokens = selling)
-    let tokensInFloat = satoshisToFloat(amountTokens);
-    let newInventories = updateInventory(config.inventories, outcomeName, -tokensInFloat);
-    let currentCost = calculateMultipleChoiceCost(config.inventories, market.b);
-    let newCost = calculateMultipleChoiceCost(newInventories, market.b);
-    let satoshisToReceive = currentCost - newCost;
-
-    let satoshiAmount = floatToSatoshis(satoshisToReceive);
-
-    // Check minimum price
-    if (satoshiAmount < minPrice) {
-      return #err("Price below minimum acceptable");
-    };
-
-    // Execute burn and payment
-    switch (await burnTokens(config.ledger, tokenId, caller, amountTokens)) {
-      case (#err(error)) { return #err("Failed to burn tokens: " # error) };
-      case (#ok()) {};
-    };
-
-    switch (await paySatoshisFromMarketVault(market.id, caller, satoshiAmount, tokenIdentifier)) {
-      case (#err(error)) {
-        ignore await mintTokens(config.ledger, tokenId, caller, amountTokens);
-        return #err("Failed to pay satoshis: " # error);
-      };
-      case (#ok()) {};
-    };
-
-    // Update market state
-    let updatedConfig = {
-      config with
-      inventories = newInventories;
-    };
-
-    let updatedMarket = {
-      market with
-      multipleChoiceConfig = ?updatedConfig;
-      totalVolumeSatoshis = market.totalVolumeSatoshis + satoshiAmount;
-      currentSupply = market.currentSupply - amountTokens;
-    };
-
-    markets.put(market.id, updatedMarket);
-
-    let newPrice = calculateMultipleChoicePrice(newInventories, market.b, outcomeName);
-
-    #ok({
-      satoshisReceived = satoshiAmount;
-      newPrice = newPrice;
-    });
+    #err("Selling not supported");
   };
 
   // ===== COMPOUND MARKET TRADING =====
@@ -1788,102 +1827,98 @@ persistent actor Markets {
     caller : Principal,
   ) : async Result.Result<BuyResult, Text> {
 
-    // Extract subject and binary token from identifier
     let (subjectName, binaryToken) = switch (tokenIdentifier) {
       case (#Subject(subject, token)) { (subject, token) };
-      case (_) { return #err("Invalid token identifier for compound market") };
+      case (_) { return #err("Invalid token identifier") };
     };
 
-    // Get compound configuration
     let config = switch (market.compoundConfig) {
-      case (null) { return #err("Compound configuration missing") };
-      case (?config) { config };
+      case (null) { return #err("Config missing") };
+      case (?c) { c };
     };
 
-    // Find the specific subject configuration
     let subjectConfig = switch (getSubjectConfig(config.subjects, subjectName)) {
-      case (null) { return #err("Subject not found: " # subjectName) };
-      case (?config) { config };
+      case (null) { return #err("Subject not found") };
+      case (?c) { c };
     };
 
-    // Use binary market logic for this individual subject
-    let currentPrice = calculatePrice(subjectConfig.qYes, subjectConfig.qNo, market.b, binaryToken);
-    let costInFloat = satoshisToFloat(amountSatoshis);
-    let tokensToReceive = calculateTokensForCost(
-      subjectConfig.qYes,
-      subjectConfig.qNo,
-      market.b,
-      binaryToken,
-      costInFloat,
-    );
-
-    if (tokensToReceive <= 0.0) {
-      return #err("Invalid token calculation");
+    // Select curve
+    let curve = switch (binaryToken) {
+      case (#YES) {
+        switch (subjectConfig.yesCurve) {
+          case (null) { return #err("YES curve missing") };
+          case (?c) { c };
+        };
+      };
+      case (#NO) {
+        switch (subjectConfig.noCurve) {
+          case (null) { return #err("NO curve missing") };
+          case (?c) { c };
+        };
+      };
     };
 
-    // Calculate new price after purchase for slippage check
-    let (newQYes, newQNo) = switch (binaryToken) {
-      case (#YES) { (subjectConfig.qYes + tokensToReceive, subjectConfig.qNo) };
-      case (#NO) { (subjectConfig.qYes, subjectConfig.qNo + tokensToReceive) };
-    };
-    let newPrice = calculatePrice(newQYes, newQNo, market.b, binaryToken);
+    // Bonding Curve Calculations
+    let shares = calculateBondingCurveShares(curve, amountSatoshis);
+    if (shares == 0) return #err("Amount too small");
 
-    // Check slippage protection
-    let priceIncrease = if (currentPrice > 0.0) {
-      (newPrice - currentPrice) / currentPrice;
-    } else {
-      0.0;
+    let newSupply = curve.currentSupply + shares;
+    let newCurve = { curve with currentSupply = newSupply };
+    let newPrice = calculateBondingCurvePrice(newCurve);
+
+    if (satoshisToFloat(newPrice) > maxSlippage) {
+      return #err("Price slippage too high");
     };
 
-    if (priceIncrease > maxSlippage) {
-      return #err("Price slippage too high: " # Float.toText(priceIncrease * 100.0) # "%");
-    };
-
-    // Execute financial operations - pull satoshis from subject-specific vault
+    // Financials
     switch (await pullSatoshisFromMarketVault(market.id, caller, amountSatoshis, tokenIdentifier)) {
-      case (#err(error)) { return #err("Failed to pull satoshis: " # error) };
+      case (#err(e)) { return #err("Failed to pull satoshis: " # e) };
       case (#ok()) {};
     };
 
-    // Mint tokens to appropriate ledger for this subject using ICRC-151
     let tokenId = switch (binaryToken) {
       case (#YES) { subjectConfig.yesTokenId };
       case (#NO) { subjectConfig.noTokenId };
     };
 
-    let tokensToMint = floatToSatoshis(tokensToReceive);
-    switch (await mintTokens(config.ledger, tokenId, caller, tokensToMint)) {
-      case (#err(error)) {
-        // Rollback: refund satoshis on mint failure
+    switch (await mintTokens(config.ledger, tokenId, caller, shares)) {
+      case (#err(e)) {
         ignore await paySatoshisFromMarketVault(market.id, caller, amountSatoshis, tokenIdentifier);
-        return #err("Failed to mint tokens: " # error);
+        return #err("Failed to mint: " # e);
       };
       case (#ok()) {};
     };
 
-    // Update compound market state - only update the specific subject
-    let updatedSubjectConfig = switch (binaryToken) {
-      case (#YES) { { subjectConfig with qYes = newQYes } };
-      case (#NO) { { subjectConfig with qNo = newQNo } };
+    // Update State
+    let updatedCurve : BondingCurveConfig = {
+      curve with
+      currentSupply = newSupply;
+      poolBalance = curve.poolBalance + amountSatoshis;
     };
 
-    // Update only this subject in the compound market, leave others unchanged
+    let updatedSubjectConfig = switch (binaryToken) {
+      case (#YES) { { subjectConfig with yesCurve = ?updatedCurve } };
+      case (#NO) { { subjectConfig with noCurve = ?updatedCurve } };
+    };
+
     let updatedSubjects = updateSubjectInCompound(config.subjects, subjectName, updatedSubjectConfig);
     let updatedConfig = { config with subjects = updatedSubjects };
-
     let updatedMarket = {
       market with
       compoundConfig = ?updatedConfig;
       totalVolumeSatoshis = market.totalVolumeSatoshis + amountSatoshis;
-      currentSupply = market.currentSupply + tokensToMint;
+      currentSupply = market.currentSupply + shares;
     };
-
     markets.put(market.id, updatedMarket);
 
+    // Record Tx & Position
+    recordBuyTransaction(updatedMarket, caller, tokenIdentifier, shares, amountSatoshis, newPrice);
+    updateParimutuelPosition(market.id, subjectName # "-" # (switch (binaryToken) { case (#YES) "YES"; case (#NO) "NO" }), caller, shares, amountSatoshis);
+
     #ok({
-      tokensReceived = tokensToReceive;
+      tokensReceived = satoshisToFloat(shares);
       actualCostSatoshis = amountSatoshis;
-      newPrice = newPrice;
+      newPrice = satoshisToFloat(newPrice);
     });
   };
 
@@ -1894,104 +1929,7 @@ persistent actor Markets {
     minPrice : Nat64,
     caller : Principal,
   ) : async Result.Result<SellResult, Text> {
-
-    // Extract subject and binary token from identifier
-    let (subjectName, binaryToken) = switch (tokenIdentifier) {
-      case (#Subject(subject, token)) { (subject, token) };
-      case (_) { return #err("Invalid token identifier for compound market") };
-    };
-
-    // Get compound configuration
-    let config = switch (market.compoundConfig) {
-      case (null) { return #err("Compound configuration missing") };
-      case (?config) { config };
-    };
-
-    // Find the specific subject configuration
-    let subjectConfig = switch (getSubjectConfig(config.subjects, subjectName)) {
-      case (null) { return #err("Subject not found: " # subjectName) };
-      case (?config) { config };
-    };
-
-    // Determine the token ID for this subject's token using ICRC-151
-    let tokenId = switch (binaryToken) {
-      case (#YES) { subjectConfig.yesTokenId };
-      case (#NO) { subjectConfig.noTokenId };
-    };
-
-    // Check user has sufficient tokens to sell
-    switch (await getTokenBalance(config.ledger, tokenId, caller)) {
-      case (#err(error)) { return #err("Failed to check balance: " # error) };
-      case (#ok(balance)) {
-        if (balance < amountTokens) {
-          return #err("Insufficient token balance: have " # Nat64.toText(balance) # ", need " # Nat64.toText(amountTokens));
-        };
-      };
-    };
-
-    // Calculate satoshis to receive (negative tokens = selling)
-    let tokensInFloat = satoshisToFloat(amountTokens);
-    let satoshisToReceive = calculateCostForTokens(
-      subjectConfig.qYes,
-      subjectConfig.qNo,
-      market.b,
-      binaryToken,
-      -tokensInFloat // Negative for selling
-    );
-
-    let satoshiAmount = floatToSatoshis(satoshisToReceive);
-
-    // Check minimum price protection
-    if (satoshiAmount < minPrice) {
-      return #err("Price below minimum acceptable: " # Nat64.toText(satoshiAmount) # " < " # Nat64.toText(minPrice));
-    };
-
-    // Execute burn operation first
-    switch (await burnTokens(config.ledger, tokenId, caller, amountTokens)) {
-      case (#err(error)) { return #err("Failed to burn tokens: " # error) };
-      case (#ok()) {};
-    };
-
-    // Pay satoshis from subject-specific vault
-    switch (await paySatoshisFromMarketVault(market.id, caller, satoshiAmount, tokenIdentifier)) {
-      case (#err(error)) {
-        // Rollback: re-mint tokens on payment failure
-        ignore await mintTokens(config.ledger, tokenId, caller, amountTokens);
-        return #err("Failed to pay satoshis: " # error);
-      };
-      case (#ok()) {};
-    };
-
-    // Update compound market state - only update the specific subject
-    let updatedSubjectConfig = switch (binaryToken) {
-      case (#YES) {
-        { subjectConfig with qYes = subjectConfig.qYes - tokensInFloat };
-      };
-      case (#NO) {
-        { subjectConfig with qNo = subjectConfig.qNo - tokensInFloat };
-      };
-    };
-
-    // Update only this subject in the compound market, leave others unchanged
-    let updatedSubjects = updateSubjectInCompound(config.subjects, subjectName, updatedSubjectConfig);
-    let updatedConfig = { config with subjects = updatedSubjects };
-
-    let updatedMarket = {
-      market with
-      compoundConfig = ?updatedConfig;
-      totalVolumeSatoshis = market.totalVolumeSatoshis + satoshiAmount;
-      currentSupply = market.currentSupply - amountTokens;
-    };
-
-    markets.put(market.id, updatedMarket);
-
-    // Calculate new price after the sale
-    let newPrice = calculatePrice(updatedSubjectConfig.qYes, updatedSubjectConfig.qNo, market.b, binaryToken);
-
-    #ok({
-      satoshisReceived = satoshiAmount;
-      newPrice = newPrice;
-    });
+    #err("Selling not supported");
   };
 
   // Helper function to validate compound market token identifier
@@ -2027,8 +1965,22 @@ persistent actor Markets {
         switch (getSubjectConfig(config.subjects, subjectName)) {
           case (null) { #err("Subject not found: " # subjectName) };
           case (?subjectConfig) {
-            let price = calculatePrice(subjectConfig.qYes, subjectConfig.qNo, market.b, binaryToken);
-            #ok(price);
+            let curve = switch (binaryToken) {
+              case (#YES) {
+                switch (subjectConfig.yesCurve) {
+                  case (?c) c;
+                  case (null) return #err("YES curve missing");
+                };
+              };
+              case (#NO) {
+                switch (subjectConfig.noCurve) {
+                  case (?c) c;
+                  case (null) return #err("NO curve missing");
+                };
+              };
+            };
+            let priceSatoshis = calculateBondingCurvePrice(curve);
+            #ok(satoshisToFloat(priceSatoshis));
           };
         };
       };
@@ -2040,14 +1992,395 @@ persistent actor Markets {
     switch (market.compoundConfig) {
       case (null) { [] };
       case (?config) {
+        let defaultCurve : BondingCurveConfig = {
+          basePrice = 1000;
+          priceSlope = 1;
+          currentSupply = 0;
+          poolBalance = 0;
+        };
         Array.map<(Text, CompoundSubjectConfig), (Text, Float, Float)>(
           config.subjects,
           func((subjectName, subjectConfig)) {
-            let yesPrice = calculatePrice(subjectConfig.qYes, subjectConfig.qNo, market.b, #YES);
-            let noPrice = calculatePrice(subjectConfig.qYes, subjectConfig.qNo, market.b, #NO);
+            let yesCurve = switch (subjectConfig.yesCurve) {
+              case (?c) c;
+              case (null) defaultCurve;
+            };
+            let noCurve = switch (subjectConfig.noCurve) {
+              case (?c) c;
+              case (null) defaultCurve;
+            };
+
+            let yesPrice = satoshisToFloat(calculateBondingCurvePrice(yesCurve));
+            let noPrice = satoshisToFloat(calculateBondingCurvePrice(noCurve));
             (subjectName, yesPrice, noPrice);
           },
         );
+      };
+    };
+  };
+
+  // ===== MARKET RESOLUTION & PAYOUTS =====
+
+  // Resolve market - only callable by designated resolver
+  public shared (msg) func resolveMarket(
+    marketId : Nat,
+    winningOutcome : MarketResolution,
+  ) : async Result.Result<(), Text> {
+    switch (markets.get(marketId)) {
+      case (null) { return #err("Market not found") };
+      case (?market) {
+        // Validate caller is resolver
+        if (not Principal.equal(msg.caller, market.resolver)) {
+          return #err("Only the designated resolver can resolve this market");
+        };
+
+        // Check market has expired
+        let now = Nat64.fromNat(Int.abs(Time.now()));
+        if (now < market.expiry) {
+          return #err("Market has not expired yet. Cannot resolve before expiry.");
+        };
+
+        // Check not already resolved
+        if (market.resolved != null) {
+          return #err("Market is already resolved");
+        };
+
+        // Validate resolution matches market type
+        switch (market.marketType, winningOutcome) {
+          case (#Binary, #Binary(_)) { /* OK */ };
+          case (#MultipleChoice, #MultipleChoice(_)) { /* OK */ };
+          case (#Compound, #Compound(_)) { /* OK */ };
+          case (_, _) {
+            return #err("Resolution type does not match market type");
+          };
+        };
+
+        // Update market state
+        let updatedMarket = {
+          market with
+          resolved = ?winningOutcome;
+          active = false;
+        };
+        markets.put(marketId, updatedMarket);
+
+        Debug.print("Market " # Nat.toText(marketId) # " resolved with outcome: " # debug_show (winningOutcome));
+
+        #ok();
+      };
+    };
+  };
+
+  // Claim winnings - for winners after resolution
+  // Payout = stake returned + (user's share % × losing pool)
+  public shared (msg) func claimWinnings(
+    marketId : Nat
+  ) : async Result.Result<ClaimResult, Text> {
+    switch (markets.get(marketId)) {
+      case (null) { return #err("Market not found") };
+      case (?market) {
+        // Check market is resolved
+        let resolution = switch (market.resolved) {
+          case (null) { return #err("Market not yet resolved") };
+          case (?r) { r };
+        };
+
+        // Only handle binary markets for now
+        switch (market.marketType, resolution) {
+          case (#Binary, #Binary(outcome)) {
+            let binaryConfig = switch (market.binaryConfig) {
+              case (null) { return #err("Binary config missing") };
+              case (?c) { c };
+            };
+
+            // Determine winning and losing outcome keys
+            let (winningKey, losingKey) = switch (outcome) {
+              case (#Yes) { ("YES", "NO") };
+              case (#No) { ("NO", "YES") };
+            };
+
+            // Get user's position in winning outcome
+            let userPosition = getOrCreateHolderPosition(marketId, winningKey, msg.caller);
+
+            if (userPosition.shares == 0) {
+              return #err("No winning position found. You do not hold tokens for the winning outcome.");
+            };
+
+            if (userPosition.claimed) {
+              return #err("Winnings already claimed");
+            };
+
+            // Get pool balances from curves
+            let winningPool = switch (binaryConfig.yesCurve, binaryConfig.noCurve, outcome) {
+              case (?yesCurve, _, #Yes) { yesCurve.poolBalance };
+              case (_, ?noCurve, #No) { noCurve.poolBalance };
+              case (_, _, _) { return #err("Bonding curve config missing") };
+            };
+
+            let losingPool = switch (binaryConfig.yesCurve, binaryConfig.noCurve, outcome) {
+              case (_, ?noCurve, #Yes) { noCurve.poolBalance };
+              case (?yesCurve, _, #No) { yesCurve.poolBalance };
+              case (_, _, _) { return #err("Bonding curve config missing") };
+            };
+
+            // Get total winning shares
+            let totalWinningShares = switch (binaryConfig.yesCurve, binaryConfig.noCurve, outcome) {
+              case (?yesCurve, _, #Yes) { yesCurve.currentSupply };
+              case (_, ?noCurve, #No) { noCurve.currentSupply };
+              case (_, _, _) { return #err("Bonding curve config missing") };
+            };
+
+            if (totalWinningShares == 0) {
+              return #err("No winning shares exist");
+            };
+
+            // Calculate payout:
+            // 1. Return user's stake (totalPaid)
+            // 2. Add proportional share of losing pool
+            let stakeReturned = userPosition.totalPaid;
+
+            // winningsFromLosingPool = (userShares / totalWinningShares) × losingPool
+            let userShareRatio = Nat64.toNat(userPosition.shares);
+            let totalRatio = Nat64.toNat(totalWinningShares);
+            let losingPoolNat = Nat64.toNat(losingPool);
+
+            let winningsFromLosingPool = Nat64.fromNat((userShareRatio * losingPoolNat) / totalRatio);
+            let totalPayout = stakeReturned + winningsFromLosingPool;
+
+            // Burn user's tokens
+            let tokenId = switch (outcome) {
+              case (#Yes) { binaryConfig.yesTokenId };
+              case (#No) { binaryConfig.noTokenId };
+            };
+
+            switch (await burnTokens(binaryConfig.ledger, tokenId, msg.caller, userPosition.shares)) {
+              case (#err(e)) { return #err("Failed to burn tokens: " # e) };
+              case (#ok()) {};
+            };
+
+            // Pay user from vault
+            switch (await paySatoshisFromMarketVault(marketId, msg.caller, totalPayout, #Binary(switch (outcome) { case (#Yes) #YES; case (#No) #NO }))) {
+              case (#err(e)) {
+                // Rollback: re-mint tokens
+                ignore await mintTokens(binaryConfig.ledger, tokenId, msg.caller, userPosition.shares);
+                return #err("Failed to pay winnings: " # e);
+              };
+              case (#ok()) {};
+            };
+
+            // Mark position as claimed
+            let updatedPosition = {
+              userPosition with
+              claimed = true;
+              shares = 0 : Nat64;
+            };
+            updateHolderPosition(marketId, winningKey, msg.caller, updatedPosition);
+
+            Debug.print("User " # Principal.toText(msg.caller) # " claimed " # Nat64.toText(totalPayout) # " sats from market " # Nat.toText(marketId));
+
+            #ok({
+              stakeReturned = stakeReturned;
+              winningsFromLosingPool = winningsFromLosingPool;
+              totalPayout = totalPayout;
+            });
+          };
+
+          case (#MultipleChoice, #MultipleChoice(winningOutcome)) {
+            let mcConfig = switch (market.multipleChoiceConfig) {
+              case (null) { return #err("Multiple choice config missing") };
+              case (?c) { c };
+            };
+
+            // Get user's position in winning outcome
+            let userPosition = getOrCreateHolderPosition(marketId, winningOutcome, msg.caller);
+
+            if (userPosition.shares == 0) {
+              return #err("No winning position found. You do not hold tokens for the winning outcome: " # winningOutcome);
+            };
+
+            if (userPosition.claimed) {
+              return #err("Winnings already claimed");
+            };
+
+            // Get winning pool and total winning shares
+            let winningCurve = switch (Array.find<(Text, BondingCurveConfig)>(mcConfig.outcomeCurves, func((n, _)) = n == winningOutcome)) {
+              case (null) { return #err("Winning curve not found") };
+              case (?(_, c)) { c };
+            };
+
+            let winningPool = winningCurve.poolBalance;
+            let totalWinningShares = winningCurve.currentSupply;
+
+            // Calculate losing pool (sum of all other outcomes' pools)
+            var losingPool : Nat64 = 0;
+            for ((name, curve) in mcConfig.outcomeCurves.vals()) {
+              if (name != winningOutcome) {
+                losingPool += curve.poolBalance;
+              };
+            };
+
+            if (totalWinningShares == 0) {
+              return #err("No winning shares exist");
+            };
+
+            // Calculate payout
+            let stakeReturned = userPosition.totalPaid;
+            let userShareRatio = Nat64.toNat(userPosition.shares);
+            let totalRatio = Nat64.toNat(totalWinningShares);
+            let losingPoolNat = Nat64.toNat(losingPool);
+
+            let winningsFromLosingPool = Nat64.fromNat((userShareRatio * losingPoolNat) / totalRatio);
+            let totalPayout = stakeReturned + winningsFromLosingPool;
+
+            // Burn user's tokens
+            let tokenId = switch (getTokenIdForOutcome(mcConfig.outcomes, winningOutcome)) {
+              case (null) { return #err("Token ID not found") };
+              case (?id) { id };
+            };
+
+            switch (await burnTokens(mcConfig.ledger, tokenId, msg.caller, userPosition.shares)) {
+              case (#err(e)) { return #err("Failed to burn tokens: " # e) };
+              case (#ok()) {};
+            };
+
+            // Pay user from vault
+            switch (await paySatoshisFromMarketVault(marketId, msg.caller, totalPayout, #Outcome(winningOutcome))) {
+              case (#err(e)) {
+                ignore await mintTokens(mcConfig.ledger, tokenId, msg.caller, userPosition.shares);
+                return #err("Failed to pay winnings: " # e);
+              };
+              case (#ok()) {};
+            };
+
+            // Mark position as claimed
+            let updatedPosition = {
+              userPosition with
+              claimed = true;
+              shares = 0 : Nat64;
+            };
+            updateHolderPosition(marketId, winningOutcome, msg.caller, updatedPosition);
+
+            Debug.print("User " # Principal.toText(msg.caller) # " claimed " # Nat64.toText(totalPayout) # " sats from MC market " # Nat.toText(marketId));
+
+            #ok({
+              stakeReturned = stakeReturned;
+              winningsFromLosingPool = winningsFromLosingPool;
+              totalPayout = totalPayout;
+            });
+          };
+
+          case (#Compound, #Compound(subjectResults)) {
+            let compoundConfig = switch (market.compoundConfig) {
+              case (null) { return #err("Compound config missing") };
+              case (?c) { c };
+            };
+
+            // For compound markets, we need to check each subject independently
+            // User can claim winnings from each subject they bet correctly on
+            var totalStakeReturned : Nat64 = 0;
+            var totalWinningsFromLosingPool : Nat64 = 0;
+
+            for ((subjectName, outcome) in subjectResults.vals()) {
+              label subjectLoop {
+                let winningKey = subjectName # "-" # (switch (outcome) { case (#Yes) "YES"; case (#No) "NO" });
+
+                let userPosition = getOrCreateHolderPosition(marketId, winningKey, msg.caller);
+
+                if (userPosition.shares == 0 or userPosition.claimed) {
+                  // Skip this subject
+                } else {
+                  // Get subject config
+                  switch (getSubjectConfig(compoundConfig.subjects, subjectName)) {
+                    case (null) { /* skip */ };
+                    case (?subjectConfig) {
+                      // Get curves based on outcome
+                      let curveData : ?(BondingCurveConfig, BondingCurveConfig, TokenId) = switch (outcome) {
+                        case (#Yes) {
+                          switch (subjectConfig.yesCurve, subjectConfig.noCurve) {
+                            case (?wc, ?lc) {
+                              ?(wc, lc, subjectConfig.yesTokenId);
+                            };
+                            case (_, _) { null };
+                          };
+                        };
+                        case (#No) {
+                          switch (subjectConfig.noCurve, subjectConfig.yesCurve) {
+                            case (?wc, ?lc) {
+                              ?(wc, lc, subjectConfig.noTokenId);
+                            };
+                            case (_, _) { null };
+                          };
+                        };
+                      };
+
+                      switch (curveData) {
+                        case (null) { /* skip */ };
+                        case (?(winningCurve, losingCurve, tokenId)) {
+                          let totalWinningShares = winningCurve.currentSupply;
+                          let losingPool = losingCurve.poolBalance;
+
+                          if (totalWinningShares > 0) {
+                            let stakeReturned = userPosition.totalPaid;
+                            let userShareRatio = Nat64.toNat(userPosition.shares);
+                            let totalRatio = Nat64.toNat(totalWinningShares);
+                            let losingPoolNat = Nat64.toNat(losingPool);
+
+                            let winningsFromLosingPool = Nat64.fromNat((userShareRatio * losingPoolNat) / totalRatio);
+                            let subjectPayout = stakeReturned + winningsFromLosingPool;
+
+                            // Burn tokens
+                            let burnResult = await burnTokens(compoundConfig.ledger, tokenId, msg.caller, userPosition.shares);
+                            switch (burnResult) {
+                              case (#err(e)) { /* skip to next subject */ };
+                              case (#ok()) {
+                                // Pay user
+                                let payTokenId = #Subject((subjectName, switch (outcome) { case (#Yes) #YES; case (#No) #NO }));
+                                let payResult = await paySatoshisFromMarketVault(marketId, msg.caller, subjectPayout, payTokenId);
+                                switch (payResult) {
+                                  case (#err(e)) {
+                                    ignore await mintTokens(compoundConfig.ledger, tokenId, msg.caller, userPosition.shares);
+                                  };
+                                  case (#ok()) {
+                                    // Mark claimed
+                                    let updatedPosition = {
+                                      userPosition with
+                                      claimed = true;
+                                      shares = 0 : Nat64;
+                                    };
+                                    updateHolderPosition(marketId, winningKey, msg.caller, updatedPosition);
+
+                                    totalStakeReturned += stakeReturned;
+                                    totalWinningsFromLosingPool += winningsFromLosingPool;
+                                  };
+                                };
+                              };
+                            };
+                          };
+                        };
+                      };
+                    };
+                  };
+                };
+              };
+            };
+
+            if (totalStakeReturned == 0 and totalWinningsFromLosingPool == 0) {
+              return #err("No winning positions found for any resolved subjects");
+            };
+
+            let totalPayout = totalStakeReturned + totalWinningsFromLosingPool;
+            Debug.print("User " # Principal.toText(msg.caller) # " claimed " # Nat64.toText(totalPayout) # " sats from Compound market " # Nat.toText(marketId));
+
+            #ok({
+              stakeReturned = totalStakeReturned;
+              winningsFromLosingPool = totalWinningsFromLosingPool;
+              totalPayout = totalPayout;
+            });
+          };
+
+          case (_, _) {
+            return #err("Resolution type mismatch");
+          };
+        };
       };
     };
   };
@@ -2079,7 +2412,21 @@ persistent actor Markets {
             switch (market.binaryConfig) {
               case (null) { #err("Binary config missing") };
               case (?config) {
-                let price = calculatePrice(config.qYes, config.qNo, market.b, binaryToken);
+                let curve = switch (binaryToken) {
+                  case (#YES) {
+                    switch (config.yesCurve) {
+                      case (?c) c;
+                      case (_) return #err("Curve missing");
+                    };
+                  };
+                  case (#NO) {
+                    switch (config.noCurve) {
+                      case (?c) c;
+                      case (_) return #err("Curve missing");
+                    };
+                  };
+                };
+                let price = satoshisToFloat(calculateBondingCurvePrice(curve));
                 #ok(price);
               };
             };
@@ -2088,7 +2435,15 @@ persistent actor Markets {
             switch (market.multipleChoiceConfig) {
               case (null) { #err("Multiple choice config missing") };
               case (?config) {
-                let price = calculateMultipleChoicePrice(config.inventories, market.b, outcomeName);
+                switch (getTokenIdForOutcome(config.outcomes, outcomeName)) {
+                  case (null) return #err("Outcome not found");
+                  case (_) {};
+                };
+                let curve = switch (Array.find<(Text, BondingCurveConfig)>(config.outcomeCurves, func((n, _)) = n == outcomeName)) {
+                  case (?(_, c)) c;
+                  case (null) return #err("Curve missing");
+                };
+                let price = satoshisToFloat(calculateBondingCurvePrice(curve));
                 #ok(price);
               };
             };
@@ -2100,7 +2455,21 @@ persistent actor Markets {
                 switch (getSubjectConfig(config.subjects, subjectName)) {
                   case (null) { #err("Subject not found") };
                   case (?subjectConfig) {
-                    let price = calculatePrice(subjectConfig.qYes, subjectConfig.qNo, market.b, binaryToken);
+                    let curve = switch (binaryToken) {
+                      case (#YES) {
+                        switch (subjectConfig.yesCurve) {
+                          case (?c) c;
+                          case (_) return #err("Curve missing");
+                        };
+                      };
+                      case (#NO) {
+                        switch (subjectConfig.noCurve) {
+                          case (?c) c;
+                          case (_) return #err("Curve missing");
+                        };
+                      };
+                    };
+                    let price = satoshisToFloat(calculateBondingCurvePrice(curve));
                     #ok(price);
                   };
                 };
@@ -2167,16 +2536,29 @@ persistent actor Markets {
       case (null) { #err("Market not found") };
       case (?market) {
         let prices = Buffer.Buffer<(TokenIdentifier, Float)>(10);
+        let defaultCurve : BondingCurveConfig = {
+          basePrice = 1000;
+          priceSlope = 1;
+          currentSupply = 0;
+          poolBalance = 0;
+        };
 
         switch (market.marketType) {
           case (#Binary) {
             switch (market.binaryConfig) {
               case (null) { return #err("Binary config missing") };
               case (?config) {
-                let yesPrice = calculatePrice(config.qYes, config.qNo, market.b, #YES);
-                let noPrice = calculatePrice(config.qYes, config.qNo, market.b, #NO);
-                prices.add((#Binary(#YES), yesPrice));
-                prices.add((#Binary(#NO), noPrice));
+                let yesCurve = switch (config.yesCurve) {
+                  case (?c) c;
+                  case (_) defaultCurve;
+                };
+                let noCurve = switch (config.noCurve) {
+                  case (?c) c;
+                  case (_) defaultCurve;
+                };
+
+                prices.add((#Binary(#YES), satoshisToFloat(calculateBondingCurvePrice(yesCurve))));
+                prices.add((#Binary(#NO), satoshisToFloat(calculateBondingCurvePrice(noCurve))));
               };
             };
           };
@@ -2185,7 +2567,11 @@ persistent actor Markets {
               case (null) { return #err("Multiple choice config missing") };
               case (?config) {
                 for ((outcomeName, _) in config.outcomes.vals()) {
-                  let price = calculateMultipleChoicePrice(config.inventories, market.b, outcomeName);
+                  let curve = switch (Array.find<(Text, BondingCurveConfig)>(config.outcomeCurves, func((n, _)) = n == outcomeName)) {
+                    case (?(_, c)) c;
+                    case (null) defaultCurve;
+                  };
+                  let price = satoshisToFloat(calculateBondingCurvePrice(curve));
                   prices.add((#Outcome(outcomeName), price));
                 };
               };
@@ -2196,10 +2582,17 @@ persistent actor Markets {
               case (null) { return #err("Compound config missing") };
               case (?config) {
                 for ((subjectName, subjectConfig) in config.subjects.vals()) {
-                  let yesPrice = calculatePrice(subjectConfig.qYes, subjectConfig.qNo, market.b, #YES);
-                  let noPrice = calculatePrice(subjectConfig.qYes, subjectConfig.qNo, market.b, #NO);
-                  prices.add((#Subject((subjectName, #YES)), yesPrice));
-                  prices.add((#Subject((subjectName, #NO)), noPrice));
+                  let yesCurve = switch (subjectConfig.yesCurve) {
+                    case (?c) c;
+                    case (_) defaultCurve;
+                  };
+                  let noCurve = switch (subjectConfig.noCurve) {
+                    case (?c) c;
+                    case (_) defaultCurve;
+                  };
+
+                  prices.add((#Subject((subjectName, #YES)), satoshisToFloat(calculateBondingCurvePrice(yesCurve))));
+                  prices.add((#Subject((subjectName, #NO)), satoshisToFloat(calculateBondingCurvePrice(noCurve))));
                 };
               };
             };
@@ -2342,5 +2735,69 @@ persistent actor Markets {
       pMap.put(p, bal);
     };
     marketHoldersEntries := [];
+  };
+
+  // Helper to record buy transaction
+  private func recordBuyTransaction(
+    market : MarketState,
+    caller : Principal,
+    tokenIdentifier : TokenIdentifier,
+    shares : Nat64,
+    amountSatoshis : Nat64,
+    newPrice : Nat64,
+  ) {
+    let txId = nextTxId;
+    nextTxId += 1;
+
+    let tx : MarketTransaction = {
+      txId = txId;
+      marketId = market.id;
+      user = caller;
+      operation = #Buy;
+      tokenIdentifier = tokenIdentifier;
+      amount = satoshisToFloat(shares);
+      price = satoshisToFloat(newPrice);
+      cost = Nat64.toNat(amountSatoshis);
+      timestamp = Nat64.fromNat(Int.abs(Time.now()));
+    };
+
+    let txList = switch (marketTransactions.get(market.id)) {
+      case (null) {
+        let b = Buffer.Buffer<MarketTransaction>(50);
+        marketTransactions.put(market.id, b);
+        b;
+      };
+      case (?b) { b };
+    };
+    txList.add(tx);
+
+    // Update legacy holder balance
+    let userMap = switch (marketHolders.get(market.id)) {
+      case (null) {
+        let m = TrieMap.TrieMap<Principal, Float>(Principal.equal, Principal.hash);
+        marketHolders.put(market.id, m);
+        m;
+      };
+      case (?m) { m };
+    };
+    let currentBal = Option.get(userMap.get(caller), 0.0);
+    userMap.put(caller, currentBal + satoshisToFloat(shares));
+  };
+
+  // Helper to update parimutuel position
+  private func updateParimutuelPosition(
+    marketId : Nat,
+    outcomeKey : Text,
+    caller : Principal,
+    shares : Nat64,
+    amountSatoshis : Nat64,
+  ) {
+    let currentPosition = getOrCreateHolderPosition(marketId, outcomeKey, caller);
+    let updatedPosition : HolderPosition = {
+      shares = currentPosition.shares + shares;
+      totalPaid = currentPosition.totalPaid + amountSatoshis;
+      claimed = false;
+    };
+    updateHolderPosition(marketId, outcomeKey, caller, updatedPosition);
   };
 };

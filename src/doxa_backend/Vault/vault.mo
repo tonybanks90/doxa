@@ -628,18 +628,23 @@ persistent actor Vault {
             // Check vault balance
             try {
               let balance = await ledgerActor.icrc1_balance_of(vaultAccount);
-              if (balance < amount + ckbtcFee) {
-                return #err("Insufficient vault balance. Required: " # Nat.toText(amount + ckbtcFee) # ", Available: " # Nat.toText(balance));
+              if (balance < amount) {
+                return #err("Insufficient vault balance. Required: " # Nat.toText(amount) # ", Available: " # Nat.toText(balance));
               };
             } catch (error) {
               return #err("Failed to check vault balance: ");
             };
 
+            if (amount <= ckbtcFee) {
+              return #err("Payout amount too small to cover fees");
+            };
+            let netAmount = amount - ckbtcFee;
+
             // Execute transfer
             let transferArgs : TransferArgs = {
               from_subaccount = ?subaccount;
               to = userAccount;
-              amount = amount;
+              amount = netAmount;
               fee = ?ckbtcFee;
               memo = ?Blob.toArray(Text.encodeUtf8("Market payout: " # Nat.toText(marketId)));
               created_at_time = ?timestamp;
