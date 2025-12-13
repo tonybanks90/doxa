@@ -1,5 +1,15 @@
 {
   "canisters": {
+    "ckbtc_ledger": {
+      "type": "custom",
+      "candid": "icrc1_ledger.did",
+      "wasm": "icrc1_ledger.wasm.gz",
+      "remote": {
+        "id": {
+          "ic": "mxzaz-hqaaa-aaaar-qaada-cai"
+        }
+      }
+    },
     "marketfactory": {
       "main": "src/doxa_backend/MarketFactory/factory.mo",
       "type": "motoko"

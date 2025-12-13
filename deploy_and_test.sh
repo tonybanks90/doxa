@@ -1,156 +1,115 @@
 #!/bin/bash
+# Deploy and Test Script - Full binary market resolution lifecycle
 
-# Exit on error
 set -e
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-echo -e "${BLUE}🚀 Doxa Prediction Markets - Full Deployment and Test${NC}"
-echo "========================================================"
-
-# Configuration
-NETWORK="local"
-IDENTITY="default"
-
-print_status() { echo -e "${GREEN}✅ $1${NC}"; }
 print_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
-print_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
+print_status() { echo -e "${GREEN}✅ $1${NC}"; }
 print_error() { echo -e "${RED}❌ $1${NC}"; }
 
-# ============================================
-# STEP 1: Deploy Core Canisters
-# ============================================
-print_info "Deploying core canisters..."
+NETWORK="local"
 
-dfx deploy marketfactory --network $NETWORK
-dfx deploy vault --network $NETWORK
-dfx deploy markettrade --network $NETWORK
+# ===== STEP 1: Clean Start =====
+print_info "Stopping dfx and starting clean..."
+dfx stop 2>/dev/null || true
+dfx start --clean --background
+sleep 3
+print_status "DFX started with clean state"
 
-print_status "Core canisters deployed"
+# ===== STEP 2: Deploy Backend Canisters =====
+print_info "Deploying backend canisters..."
 
-# Get canister IDs
-FACTORY_ID=$(dfx canister id marketfactory --network $NETWORK)
+# Get default principal for minting account
+dfx identity use default
+DEFAULT_PRINCIPAL=$(dfx identity get-principal)
+
+# Deploy ckBTC ledger with init args
+print_info "Deploying ckbtc_ledger..."
+dfx deploy ckbtc_ledger --argument "(variant { Init = record { 
+  minting_account = record { owner = principal \"$DEFAULT_PRINCIPAL\"; subaccount = null }; 
+  initial_balances = vec {}; 
+  transfer_fee = 10; 
+  token_name = \"ckBTC Test\"; 
+  token_symbol = \"ckBTC\"; 
+  metadata = vec {}; 
+  feature_flags = opt record { icrc2 = true };
+  archive_options = record { 
+    num_blocks_to_archive = 1000; 
+    trigger_threshold = 500; 
+    controller_id = principal \"$DEFAULT_PRINCIPAL\"; 
+    max_message_size_bytes = null; 
+    cycles_for_archive_creation = null; 
+    node_max_memory_size_bytes = null; 
+    max_transactions_per_response = null 
+  } 
+} })" --network $NETWORK --yes
+
+print_info "Deploying vault..."
+dfx deploy vault --network $NETWORK --yes
+
+print_info "Deploying markettrade..."
+dfx deploy markettrade --network $NETWORK --yes
+
+print_info "Deploying marketfactory..."
+dfx deploy marketfactory --network $NETWORK --yes
+
+print_status "All backend canisters deployed"
+
+# ===== STEP 3: Configure Canisters =====
+print_info "Configuring canister relationships..."
+
 VAULT_ID=$(dfx canister id vault --network $NETWORK)
-MARKETS_ID=$(dfx canister id markettrade --network $NETWORK)
+MARKETTRADE_ID=$(dfx canister id markettrade --network $NETWORK)
+MARKETFACTORY_ID=$(dfx canister id marketfactory --network $NETWORK)
+LEDGER_ID=$(dfx canister id ckbtc_ledger --network $NETWORK)
 
-echo "    MarketFactory: $FACTORY_ID"
-echo "    Vault:         $VAULT_ID"
-echo "    MarkeTrade:    $MARKETS_ID"
+# Configure vault using initialize
+dfx canister call vault initialize "(principal \"$MARKETTRADE_ID\", principal \"$LEDGER_ID\")" --network $NETWORK
 
-# ============================================
-# STEP 2: Upload ICRC-151 WASM using Python script
-# ============================================
-print_info "Uploading ICRC-151 WASM to MarketFactory..."
-
-python3 upload-wasm.py ./wasm/icrc151.wasm marketfactory
-
-print_status "ICRC-151 WASM uploaded"
-
-# ============================================
-# STEP 3: Set up ALL inter-canister connections
-# ============================================
-print_info "Setting up inter-canister connections..."
-
-# 1. Set Markets canister in Factory
-print_info "Setting Markets canister in Factory..."
-dfx canister call marketfactory setMarketsCanister "(principal \"$MARKETS_ID\")" --network $NETWORK
-
-# 2. Set TokenFactory in MarkeTrade
-print_info "Setting TokenFactory in MarkeTrade..."
-dfx canister call markettrade setTokenFactory "(principal \"$FACTORY_ID\")" --network $NETWORK
-
-# 3. Set Vault in MarkeTrade
-print_info "Setting Vault in MarkeTrade..."
+# Configure markettrade
+dfx canister call markettrade setTokenFactory "(principal \"$MARKETFACTORY_ID\")" --network $NETWORK
 dfx canister call markettrade setVaultCanister "(principal \"$VAULT_ID\")" --network $NETWORK
 
-# 4. Initialize Vault with Markets canister (use a dummy ledger for now if no ckBTC)
-print_info "Initializing Vault with Markets canister..."
-# We'll use a placeholder for ckBTC ledger - the vault initialize takes markets + ledger
-CKBTC_LEDGER="ryjl3-tyaaa-aaaaa-aaaba-cai"  # Standard ckBTC ledger principal
-dfx canister call vault initialize "(principal \"$MARKETS_ID\", principal \"$CKBTC_LEDGER\")" --network $NETWORK || true
+# Configure marketfactory  
+dfx canister call marketfactory setMarketsCanister "(principal \"$MARKETTRADE_ID\")" --network $NETWORK
 
-print_status "Inter-canister connections established"
+print_status "Canisters configured"
 
-# ============================================
-# STEP 4: Create Binary Market (from test_market_creation.sh)
-# ============================================
-print_info "Testing market creation (from test_market_creation.sh)..."
+# Upload ICRC-151 WASM to factory
+print_info "Uploading ICRC-151 WASM to factory..."
+python3 upload-wasm.py
+if [ $? -ne 0 ]; then
+  print_error "Failed to upload WASM"
+  exit 1
+fi
+print_status "WASM uploaded"
 
-# Calculate timestamps (nanoseconds) - exactly as in test_market_creation.sh
-NOW=$(date +%s)
-CLOSE_TIME=$(( ($NOW + 3600) * 1000000000 ))
-EXPIRATION_TIME=$(( ($NOW + 7200) * 1000000000 ))
+# ===== STEP 4: Fund Wallet & Top Up Factory =====
+print_info "Fabricating cycles for market creation..."
+dfx ledger fabricate-cycles --canister $(dfx identity get-wallet) --amount 1000 --network $NETWORK
+dfx canister call marketfactory acceptCycles --with-cycles 5000000000000 --wallet $(dfx identity get-wallet) --network $NETWORK
 
-echo "Close Time: $CLOSE_TIME"
-echo "Expiration Time: $EXPIRATION_TIME"
+# ===== STEP 5: Create Test Identity =====
+print_info "Setting up test identity..."
+dfx identity new testuser --storage-mode=plaintext 2>/dev/null || true
 
-echo ""
-echo -e "${BLUE}------------------------------------------------${NC}"
-echo -e "${BLUE}Creating Binary Market${NC}"
-echo -e "${BLUE}------------------------------------------------${NC}"
+# Mint ckBTC to testuser
+dfx identity use default
+TESTUSER=$(dfx identity get-principal --identity testuser)
+dfx canister call ckbtc_ledger icrc1_transfer "(record { 
+  to = record { owner = principal \"$TESTUSER\"; subaccount = null }; 
+  amount = 1000000000000 
+})" --network $NETWORK
 
-dfx canister call marketfactory createBinaryMarket "(
-  record {
-    title = \"Will Bitcoin hit \$100k by 2025?\";
-    description = \"Prediction market for Bitcoin price.\";
-    category = variant { Crypto };
-    image = variant { ImageUrl = \"https://cryptologos.cc/logos/bitcoin-btc-logo.png\" };
-    tags = vec { variant { Crypto }; variant { Technology } };
-    bettingCloseTime = $CLOSE_TIME;
-    expirationTime = $EXPIRATION_TIME;
-    resolutionLink = \"https://coingecko.com\";
-    resolutionDescription = \"Price on CoinGecko at expiration.\";
-  }
-)"
+print_status "Test environment ready"
 
-print_status "Binary Market created"
+# ===== STEP 6: Run Resolution Test =====
+print_info "Running binary resolution test..."
+./test_binary_resolution.sh
 
-# ============================================
-# STEP 5: Get Market Info
-# ============================================
-echo ""
-echo -e "${BLUE}------------------------------------------------${NC}"
-echo -e "${BLUE}Getting Market Info${NC}"
-echo -e "${BLUE}------------------------------------------------${NC}"
-
-print_info "Getting market details from MarkeTrade..."
-dfx canister call markettrade getMarket "(1:nat)" --network $NETWORK || \
-  print_warning "getMarket failed"
-
-print_info "Getting market prices..."
-dfx canister call markettrade getMarketPrice "(1:nat, variant { Binary = variant { YES } })" --network $NETWORK || \
-  print_warning "getMarketPrice failed"
-
-# ============================================
-# STEP 6: Test Buy Tokens
-# ============================================
-echo ""
-echo -e "${BLUE}------------------------------------------------${NC}"
-echo -e "${BLUE}Testing Token Purchase${NC}"
-echo -e "${BLUE}------------------------------------------------${NC}"
-
-CALLER_PRINCIPAL=$(dfx identity get-principal)
-print_info "Caller principal: $CALLER_PRINCIPAL"
-
-print_info "Attempting to buy YES tokens..."
-dfx canister call markettrade buyTokens "(1:nat, variant { Binary = variant { YES } }, 1000:nat64, 0.5:float64)" \
-  --network $NETWORK || print_warning "buyTokens failed"
-
-# ============================================
-# Summary
-# ============================================
-echo ""
-echo "========================================================"
-print_status "Deployment and Test Complete! 🚀"
-echo "========================================================"
-echo ""
-echo "Deployed Canisters:"
-echo "  - MarketFactory: $FACTORY_ID"
-echo "  - Vault:         $VAULT_ID"
-echo "  - MarkeTrade:    $MARKETS_ID"
-echo ""
+print_status "Deploy and test complete!"
